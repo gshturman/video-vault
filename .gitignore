@@ -1,0 +1,41 @@
+# Python venv (machine-specific, large)
+.venv/
+venv/
+env/
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Model caches (huge, re-downloadable)
+models/
+*.bin
+*.safetensors
+*.gguf
+
+# Video files (never in git)
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.info.json
+
+# Failure logs and local state
+failures.log
+*.log
+progress.json
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
