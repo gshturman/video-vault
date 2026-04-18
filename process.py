@@ -50,10 +50,14 @@ except ImportError:
 
 INPUT_DIR = Path(r"D:\videos\raw\tiktok")
 OUTPUT_DIR = Path(r"D:\Dev\second-brain\raw\tiktok")
+PROCESSED_DIR = Path(r"D:\videos\processed\tiktok")
 FAILURE_LOG = Path(r"D:\Dev\video-vault\failures.log")
 EMPTY_LOG = Path(r"D:\Dev\video-vault\empty_videos.log")
+PROCESSED_LOG = Path(r"D:\Dev\video-vault\processed.log")
 QWEN_MODEL = "qwen2.5:14b"
 COMMIT_CHUNK = 500
+_SLUG_INVALID = re.compile(r"[^a-z0-9\-]")
+_SLUG_COLLAPSE = re.compile(r"-+")
 
 _INVALID_PATH_CHARS = re.compile(r'[\\/:*?"<>|]')
 
@@ -78,13 +82,15 @@ Return a single JSON object with EXACTLY these keys and no others:
 
 {{
   "one_line_summary": "One sentence, under 25 words, describing what the video is about. Use the same language as the transcript.",
-  "key_points": ["2 to 4 short bullet strings covering the substantive content. Empty array only if the transcript truly has no speech content."]
+  "key_points": ["2 to 4 short bullet strings covering the substantive content. Empty array only if the transcript truly has no speech content."],
+  "slug": "A short English kebab-case slug describing the video's topic. 3 to 6 words. Lowercase. ASCII only. Hyphens between words. No punctuation, no emoji, no accents. Example: 'face-recognition-privacy-risk' or 'alinti-plant-electricity-peru'. Even if the transcript is Spanish, the slug is English."
 }}
 
 Rules:
 - Base answers on the transcript. Use title and description only to disambiguate unclear references.
 - Do not invent facts not present in the transcript.
-- If the transcript is empty or has no speech: one_line_summary="(no speech detected)", key_points=[].
+- If the transcript is empty or has no speech: one_line_summary="(no speech detected)", key_points=[], slug="no-speech-detected".
+- The slug should describe the CONTENT, not the creator. Ignore clickbait prefixes in the title.
 """
 
 
@@ -138,6 +144,36 @@ def read_empty_set(path: Path) -> set:
     return names
 
 
+def read_processed_set(path: Path) -> set:
+    """Read processed.log as a set of TikTok video IDs."""
+    if not path.exists():
+        return set()
+    ids = set()
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ids.add(json.loads(line)["id"])
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return ids
+
+
+def log_processed(video_id: str, slug: str, filename: str, dry_run: bool = False) -> None:
+    payload = {
+        "ts": dt.datetime.now().isoformat(timespec="seconds"),
+        "id": video_id,
+        "slug": slug,
+        "filename": filename,
+    }
+    if dry_run:
+        print(f"[dry-run] would log processed: {payload}", file=sys.stderr)
+        return
+    _append_jsonl(PROCESSED_LOG, payload)
+
+
 # --- Pure helpers ------------------------------------------------------------
 
 def load_info_json(video_path: Path) -> dict:
@@ -146,9 +182,15 @@ def load_info_json(video_path: Path) -> dict:
         return json.load(f)
 
 
-def sanitize_component(s: str) -> str:
-    cleaned = _INVALID_PATH_CHARS.sub("_", s).strip()
-    return cleaned or "unknown"
+def sanitize_slug(s: str) -> str:
+    """Normalize a Qwen-generated slug to safe kebab-case ASCII."""
+    if not s:
+        return "untitled"
+    cleaned = s.strip().lower()
+    cleaned = _SLUG_INVALID.sub("-", cleaned)
+    cleaned = _SLUG_COLLAPSE.sub("-", cleaned).strip("-")
+    cleaned = cleaned[:50].rstrip("-")
+    return cleaned or "untitled"
 
 
 def parse_upload_date(yyyymmdd: str) -> str:
@@ -177,37 +219,15 @@ def _read_source_url(md_path: Path):
     return value if isinstance(value, str) else None
 
 
-def compute_output_path(info: dict, output_dir: Path):
-    """Return (path, already_processed).
+def compute_output_path(slug: str, output_dir: Path) -> Path:
+    """Return the target output path for a given slug.
 
-    already_processed is True when the target file exists and its source_url
-    matches this video's webpage_url. On filename collision with a different
-    video, appends a short hash of the video id.
+    Collision handling: if the slug is already in use by a different video,
+    append a 2-char hash. Callers must ensure the video isn't already
+    processed (via the processed log) before calling this.
     """
-    date = parse_upload_date(info.get("upload_date", ""))
-    uploader = sanitize_component(info.get("uploader") or "unknown")
-    video_id = str(info.get("id", ""))
-    short_id = video_id[:8] if video_id else "00000000"
-    base_stem = f"{date}_{uploader}_{short_id}"
-    webpage_url = info.get("webpage_url")
-
-    candidate = output_dir / f"{base_stem}.md"
-    if not candidate.exists():
-        return candidate, False
-    if _read_source_url(candidate) == webpage_url:
-        return candidate, True
-
-    short_hash = hashlib.sha1(video_id.encode("utf-8")).hexdigest()[:2]
-    hashed = output_dir / f"{base_stem}_{short_hash}.md"
-    if not hashed.exists():
-        return hashed, False
-    if _read_source_url(hashed) == webpage_url:
-        return hashed, True
-
-    long_hash = hashlib.sha1(video_id.encode("utf-8")).hexdigest()[:4]
-    long_hashed = output_dir / f"{base_stem}_{long_hash}.md"
-    already = long_hashed.exists() and _read_source_url(long_hashed) == webpage_url
-    return long_hashed, already
+    safe = sanitize_slug(slug)
+    return output_dir / f"{safe}.md"
 
 
 # --- Rendering ---------------------------------------------------------------
@@ -320,7 +340,7 @@ def summarize(client: OllamaClient, transcript: str, title: str, description: st
         return json.loads(_extract_content(resp))
 
     try:
-        return _call(0.1)
+        return _call(0.0)
     except (json.JSONDecodeError, ValueError):
         return _call(0.0)
 
@@ -339,7 +359,6 @@ def process_one(
     """Process a single video. Returns (status, whisper_model).
 
     status in {"written", "skipped", "empty", "failed"}.
-    whisper_model may be a new instance if sequential_vram triggered a reload.
     """
     filename = video_path.name
 
@@ -348,10 +367,6 @@ def process_one(
     except Exception as e:
         log_failure(filename, "load_info", repr(e), dry_run=dry_run)
         return "failed", whisper_model
-
-    out_path, already_processed = compute_output_path(info, output_dir)
-    if already_processed and not dry_run:
-        return "skipped", whisper_model
 
     try:
         transcript, whisper_lang = transcribe(whisper_model, video_path)
@@ -384,6 +399,17 @@ def process_one(
     if sequential_vram:
         current_model = load_whisper(model_size)
 
+    slug = sanitize_slug(qwen.get("slug", ""))
+    out_path = compute_output_path(slug, output_dir)
+
+    # Collision handling: if slug already exists on disk from a DIFFERENT video,
+    # append 2-char hash of this video's TikTok id.
+    if out_path.exists():
+        video_id = str(info.get("id", ""))
+        if video_id:
+            short_hash = hashlib.sha1(video_id.encode("utf-8")).hexdigest()[:2]
+            out_path = output_dir / f"{slug}-{short_hash}.md"
+
     markdown = render_markdown(info, qwen, transcript, whisper_lang)
 
     if dry_run:
@@ -396,6 +422,22 @@ def process_one(
     except Exception as e:
         log_failure(filename, "write", repr(e), dry_run=dry_run)
         return "failed", current_model
+
+    # Record success and move the source video out of the input folder.
+    video_id = str(info.get("id", ""))
+    log_processed(video_id, slug, out_path.name, dry_run=dry_run)
+
+    if not dry_run:
+        try:
+            PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+            dest = PROCESSED_DIR / video_path.name
+            video_path.replace(dest)
+            info_json = video_path.with_suffix(".info.json")
+            if info_json.exists():
+                info_json.replace(PROCESSED_DIR / info_json.name)
+        except Exception as e:
+            log_failure(filename, "move", repr(e), dry_run=dry_run)
+            # Non-fatal: file was written successfully.
 
     return "written", current_model
 
@@ -436,10 +478,29 @@ def main() -> int:
         return 2
 
     empty_set = read_empty_set(EMPTY_LOG)
-    filtered = [v for v in videos if v.name not in empty_set]
-    skipped_empty = len(videos) - len(filtered)
+    processed_ids = read_processed_set(PROCESSED_LOG)
+
+    filtered = []
+    skipped_empty = 0
+    skipped_processed = 0
+    for v in videos:
+        if v.name in empty_set:
+            skipped_empty += 1
+            continue
+        # Cheap ID extraction: filename is {uploader}_{id}.mp4
+        stem = v.stem
+        if "_" in stem:
+            candidate_id = stem.rsplit("_", 1)[-1]
+            if candidate_id in processed_ids:
+                skipped_processed += 1
+                continue
+        filtered.append(v)
+
     if skipped_empty:
         print(f"info: {skipped_empty} video(s) in empty_videos.log skipped "
+              f"(delete log to force re-process)")
+    if skipped_processed:
+        print(f"info: {skipped_processed} video(s) already in processed.log skipped "
               f"(delete log to force re-process)")
     videos = filtered
 
