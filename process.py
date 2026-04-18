@@ -399,7 +399,28 @@ def process_one(
     if sequential_vram:
         current_model = load_whisper(model_size)
 
-    slug = sanitize_slug(qwen.get("slug", ""))
+    # Qwen signals "no real content" via the slug or an empty summary.
+    # Treat as empty: skip writing, log, move video.
+    raw_slug = (qwen.get("slug") or "").strip().lower()
+    summary_text = (qwen.get("one_line_summary") or "").strip().lower()
+    if (
+        raw_slug == "no-speech-detected"
+        or "no speech detected" in summary_text
+        or not qwen.get("one_line_summary")
+    ):
+        log_empty(filename, whisper_lang, int(info.get("duration") or 0), dry_run=dry_run)
+        if not dry_run:
+            try:
+                PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+                video_path.replace(PROCESSED_DIR / video_path.name)
+                info_json = video_path.with_suffix(".info.json")
+                if info_json.exists():
+                    info_json.replace(PROCESSED_DIR / info_json.name)
+            except Exception as e:
+                log_failure(filename, "move", repr(e), dry_run=dry_run)
+        return "empty", current_model
+
+    slug = sanitize_slug(raw_slug)
     out_path = compute_output_path(slug, output_dir)
 
     # Collision handling: if slug already exists on disk from a DIFFERENT video,
